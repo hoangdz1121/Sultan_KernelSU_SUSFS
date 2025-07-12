@@ -1,7 +1,7 @@
 name: Build
 permissions:
-  contents: write  # Cho phép ghi vào nội dung kho lưu trữ (để đẩy tag)
-  actions: write   # Cho phép kích hoạt actions
+  contents: write  # Allow writing to repository contents (for pushing tags)
+  actions: write   # Allows triggering actions
 
 
 inputs:
@@ -99,8 +99,17 @@ runs:
       - name: Add KernelSU Next
         shell: bash
         run: |
-          echo "Changing to kernel_platform directory: $CONFIG/kernel_platform..."
-          cd "$CONFIG/kernel_platform"
+          # Change to the root of the cloned repository first
+          echo "Changing to cloned repository root: $CONFIG..."
+          cd "$CONFIG"
+
+          # Now, change to kernel_platform relative to the current directory
+          echo "Changing to kernel_platform directory: kernel_platform..."
+          if [ ! -d "kernel_platform" ]; then
+            echo "Error: 'kernel_platform' directory not found inside '$CONFIG'."
+            exit 1
+          fi
+          cd "kernel_platform"
           
           echo "Adding KernelSU Next..."
           
@@ -114,25 +123,20 @@ runs:
           
           # Calculate KernelSU Next version based on remote commits
           BASE_VERSION=10200
-          # Use a default branch if ksun_branch is empty or 'stable' for the API call
           KSU_API_BRANCH="${{ inputs.ksun_branch }}"
           if [ -z "$KSU_API_BRANCH" ] || [ "$KSU_API_BRANCH" == "stable" ]; then
-            KSU_API_BRANCH="next" # Default to 'next' branch for API if 'stable' or empty
+            KSU_API_BRANCH="next"
           fi
 
-          # Fetch commit count from GitHub API using the passed token
-          KSU_COMMIT_COUNT=$(curl -sI -H "Authorization: Bearer ${{ inputs.github_token }}" "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=$KSU_API_BRANCH&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
+          KSU_COMMIT_COUNT=$(curl -sI -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=$KSU_API_BRANCH&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
           
           if [ -z "$KSU_COMMIT_COUNT" ]; then
             echo "Warning: Could not fetch KernelSU-Next commit count from API. Falling back to local git count."
-            # Fallback to local git count if API fails (e.g., rate limit, no token)
             KSU_COMMIT_COUNT=$(cd KernelSU-Next/kernel && /usr/bin/git rev-list --count HEAD)
           fi
 
           KSU_VERSION=$(expr $KSU_COMMIT_COUNT "+" $BASE_VERSION)
           
-          # Update DKSU_VERSION in KernelSU-Next's Makefile
-          # This ensures the KernelSU version in the Makefile matches the fetched version
           sed -i "s/DKSU_VERSION=[0-9]*/DKSU_VERSION=${KSU_VERSION}/" KernelSU-Next/kernel/Makefile || echo "Warning: Could not update DKSU_VERSION in Makefile. It might not exist or format changed."
           
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
@@ -141,6 +145,7 @@ runs:
       - name: Apply SUSFS Patches
         shell: bash
         run: |
+          # Change to kernel_platform directory
           echo "Changing to kernel_platform directory: $CONFIG/kernel_platform..."
           cd "$CONFIG/kernel_platform"
           
@@ -156,27 +161,20 @@ runs:
           echo "Applying next SUSFS patches..."
           susfs_version=$(grep '#define SUSFS_VERSION' ../common/include/linux/susfs.h | awk -F'"' '{print $2}')
           echo "SUSVER=$susfs_version" >> $GITHUB_ENV
-          echo "SusFS Version: $susfs_version"
           
-          # Copy the main SUSFS integration patch for KernelSU-Next (now relative to $CONFIG)
-          cp "../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "./" || true
-          patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
-          
-          # Apply specific SUSFS fix patches based on version (now relative to $CONFIG)
           case "$susfs_version" in
             "v1.5.5"|"v1.5.6"|"v1.5.7")
-              echo "No specific fix patches for SUSFS version $susfs_version."
+              cp "../../kernel_patches/next/0001-kernel-implement-susfs-v1.5.5-v1.5.7-KSUN-v1.0.8.patch" "./ksun_susfs_latest.patch" || true
               ;;
             "v1.5.8"|"v1.5.9")
+              cp "../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "./" || true
+              patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
               cp "../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_apk_sign.c.patch" "./" || true
               patch -p1 --forward --fuzz=3 < fix_apk_sign.c.patch || true
-
               cp "../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_core_hook.c.patch" "./" || true
               patch -p1 --forward --fuzz=3 < fix_core_hook.c.patch || true
-
               cp "../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_selinux.c.patch" "./" || true
               patch -p1 --forward --fuzz=3 < fix_selinux.c.patch || true
-
               cp "../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_ksud.c.patch" "./" || true
               patch -p1 --forward --fuzz=3 < fix_ksud.c.patch || true
               ;;
@@ -185,6 +183,9 @@ runs:
               exit 1
               ;;
           esac
+          # This patch applies the main SUSFS integration patch for KernelSU-Next
+          patch -p1 --forward < ksun_susfs_latest.patch || true
+          
           
           # Change to common directory and apply SUSFS patch
           cd ../common
@@ -225,7 +226,6 @@ runs:
           echo "Changing to kernel_platform/common directory: $CONFIG/kernel_platform/common..."
           cd "$CONFIG/kernel_platform/common"
           echo "Applying KSUN Hooks..."
-          # Ensure this path is correct relative to the current directory (./common)
           cp "../../kernel_patches/next/scope_min_manual_hooks_v1.4.patch" "./manual_hooks.patch" || true
           patch -p1 --fuzz=3 < ./manual_hooks.patch || true
           
@@ -234,8 +234,6 @@ runs:
         run: |
           echo "Changing to kernel_platform/common directory: $CONFIG/kernel_platform/common..."
           cd "$CONFIG/kernel_platform/common"
-          # Apply additional patch
-          # Ensure this path is correct relative to the current directory (./common)
           cp "../../kernel_patches/69_hide_stuff.patch" "./" || true
           patch -p1 -F 3 < 69_hide_stuff.patch || true
 
@@ -388,17 +386,13 @@ runs:
           cd "$CONFIG"
           
           echo "Copying Image"
-          # Đường dẫn đã được điều chỉnh: Image sẽ nằm trong ./out/dist/
           cp ./out/dist/Image ./AnyKernel3/Image
           
           echo "Navigating to AnyKernel3 directory..."
-          # Đường dẫn đã được điều chỉnh
           cd ./AnyKernel3
           
            if [ "${{ inputs.model }}" == "OPAce5Pro" ] || [ "${{ inputs.model }}" == "OP13" ]; then
-            # Đường dẫn đã được điều chỉnh
             cp ../kernel_patches/oneplus/hmbird/bins/* ./tools/
-            # Đường dẫn đã được điều chỉnh
             patch -F 3 < ../kernel_patches/oneplus/hmbird/ak3_hmbird_patch.patch || true
           fi
           
